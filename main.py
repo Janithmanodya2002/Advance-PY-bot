@@ -4,7 +4,6 @@ from binance.client import Client
 import keys
 import asyncio
 import telegram
-from telegram.ext import Application, CommandHandler
 import numpy as np
 import json
 import os
@@ -243,35 +242,6 @@ def send_market_analysis_image(bot, chat_id, image_buffer, caption):
         # Fallback to text message
         bot.send_message(chat_id=chat_id, text=f"Error generating chart. {caption}")
 
-async def op_command(update, context):
-    """
-    Send the latest chart for all open trades.
-    """
-    with trades_lock:
-        open_trades = [trade for trade in trades if trade['status'] in ['running', 'tp1_hit', 'tp2_hit']]
-    
-    if not open_trades:
-        await update.message.reply_text("No open trades.")
-        return
-
-    client = Client(keys.api_mainnet, keys.secret_mainnet)
-
-    for trade in open_trades:
-        symbol = trade['symbol']
-        klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=100)
-        if klines:
-            swing_highs, swing_lows = get_swing_points(klines, 5)
-            if not swing_highs or not swing_lows:
-                continue
-
-            last_swing_high = swing_highs[-1][1]
-            last_swing_low = swing_lows[-1][1]
-            
-            image_buffer = generate_fib_chart(symbol, klines, trade['side'], last_swing_high, last_swing_low, trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
-            current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-            caption = f"Open Trade: {symbol}\nSide: {trade['side']}\nEntry: {trade['entry_price']:.8f}\nCurrent Price: {current_price:.8f}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}"
-            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_buffer, caption=caption)
-
 def order_status_monitor(client, bot):
     """
     Continuously monitor the status of open and pending trades.
@@ -455,18 +425,6 @@ def main():
     # Start the order status monitor in a separate thread
     monitor_thread = threading.Thread(target=order_status_monitor, args=(client, bot), daemon=True)
     monitor_thread.start()
-
-    # Set up the Telegram bot
-    application = Application.builder().token(keys.telegram_bot_token).build()
-    
-    op_handler = CommandHandler('op', op_command)
-    application.add_handler(op_handler)
-    
-    def run_bot():
-        application.run_polling()
-
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
 
     # Get user input for mode
     while True:
