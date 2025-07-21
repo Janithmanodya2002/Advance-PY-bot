@@ -47,8 +47,14 @@ def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price
     price_range = swing_high - swing_low
     if trend == 'downtrend':
         fib_prices = [swing_high - level * price_range for level in fib_levels]
+        golden_zone_start = swing_high - (price_range * 0.5)
+        golden_zone_end = swing_high - (price_range * 0.618)
     else: # uptrend
         fib_prices = [swing_low + level * price_range for level in fib_levels]
+        golden_zone_start = swing_low + (price_range * 0.5)
+        golden_zone_end = swing_low + (price_range * 0.618)
+
+    ax.axhspan(golden_zone_start, golden_zone_end, color='gold', alpha=0.2)
 
     for level, price in zip(fib_levels, fib_prices):
         ax.axhline(y=price, color='#455A64', linestyle='--', linewidth=1.2)
@@ -63,17 +69,23 @@ def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price
     entry_high = entry_price * 1.005
     entry_low = entry_price * 0.995
     ax.axhspan(entry_low, entry_high, color='green', alpha=0.2)
-    ax.text((df.index[0] + df.index[-1])/2, (entry_high+entry_low)/2, f'ENTRY {entry_price:.2f}', color='white', va='center', ha='center', fontsize=10)
+    x_mid = df.index[0] + (df.index[-1] - df.index[0]) / 2
+    ax.text(x_mid, (entry_high+entry_low)/2, f'ENTRY {entry_price:.2f}', color='white', va='center', ha='center', fontsize=10)
 
     sl_high = sl * 1.005
     sl_low = sl * 0.995
     ax.axhspan(sl_low, sl_high, color='red', alpha=0.2)
-    ax.text((df.index[0] + df.index[-1])/2, (sl_high+sl_low)/2, f'SL {sl:.2f}', color='white', va='center', ha='center', fontsize=10)
+    ax.text(x_mid, (sl_high+sl_low)/2, f'SL {sl:.2f}', color='white', va='center', ha='center', fontsize=10)
 
     tp_high = tp1 * 1.005
     tp_low = tp1 * 0.995
     ax.axhspan(tp_low, tp_high, color='blue', alpha=0.2)
-    ax.text((df.index[0] + df.index[-1])/2, (tp_high+tp_low)/2, f'TP {tp1:.2f}', color='white', va='center', ha='center', fontsize=10)
+    ax.text(x_mid, (tp_high+tp_low)/2, f'TP {tp1:.2f}', color='white', va='center', ha='center', fontsize=10)
+
+    # Entry/SL/TP Lines
+    ax.axhline(y=entry_price, color='green', linestyle='-', linewidth=1.2)
+    ax.axhline(y=sl, color='red', linestyle='-', linewidth=1.2)
+    ax.axhline(y=tp1, color='blue', linestyle='-', linewidth=1.2)
 
     # Legend
     entry_patch = mpatches.Patch(color='green', label='ENTRY')
@@ -148,8 +160,8 @@ def get_fib_retracement(p1, p2, trend):
         golden_zone_start = p1 - (price_range * 0.5)
         golden_zone_end = p1 - (price_range * 0.618)
     else: # Uptrend
-        golden_zone_start = p2 + (price_range * 0.5)
-        golden_zone_end = p2 + (price_range * 0.618)
+        golden_zone_start = p1 + (price_range * 0.5)
+        golden_zone_end = p1 + (price_range * 0.618)
 
     entry_price = (golden_zone_start + golden_zone_end) / 2
     
@@ -177,6 +189,8 @@ def get_atr(klines, period=14):
     return atr
 
 
+from binance.exceptions import BinanceAPIException
+
 def get_klines(client, symbol, interval='15m', limit=100):
     """
     Get historical kline data from Binance.
@@ -184,8 +198,11 @@ def get_klines(client, symbol, interval='15m', limit=100):
     try:
         klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
         return klines
-    except Exception as e:
+    except BinanceAPIException as e:
         print(f"Error fetching klines for {symbol}: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred fetching klines for {symbol}: {e}")
         return None
 
 def update_trade_report(trades):
@@ -195,16 +212,16 @@ def update_trade_report(trades):
     with open('trades.json', 'w') as f:
         json.dump(trades, f, indent=4)
 
-def place_market_order(client, symbol, side, quantity):
+def place_limit_order(client, symbol, side, quantity, price):
     """
-    Place a market order on Binance.
+    Place a limit order on Binance.
     """
     try:
         # TODO: Implement actual order placement
-        print(f"Placing {side} market order for {quantity} {symbol}...")
+        print(f"Placing {side} limit order for {quantity} {symbol} at {price}...")
         return {"status": "success"}
     except Exception as e:
-        print(f"Error placing market order for {symbol}: {e}")
+        print(f"Error placing limit order for {symbol}: {e}")
         return {"status": "error", "message": str(e)}
 
 def send_start_message(bot):
@@ -229,96 +246,123 @@ def order_status_monitor(client, bot):
     """
     Continuously monitor the status of open and pending trades.
     """
+    print("Order status monitor started.")
     while True:
         try:
-            for trade in trades:
-                if trade['status'] not in ['pending', 'running', 'tp1_hit', 'tp2_hit']:
+            with trades_lock:
+                if not trades:
+                    time.sleep(1)
                     continue
 
-                symbol = trade['symbol']
-                # Fetch the last 5 seconds of k-line data
-                klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_1SECOND, limit=5)
-                if not klines:
-                    continue
+                print(f"Monitor: Checking {len(trades)} trades.")
+                for trade in trades:
+                    if trade['status'] not in ['pending', 'running', 'tp1_hit', 'tp2_hit']:
+                        continue
 
-                # Check for expired orders
-                if time.time() * 1000 - trade['timestamp'] > 4 * 60 * 60 * 1000:
-                    if trade['status'] == 'pending':
-                        try:
-                            bot.send_message(chat_id=keys.telegram_chat_id, text=f"⚠️ TRADE INVALIDATED ⚠️\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Order expired (4 hours)")
-                        except Exception as e:
-                            print(f"Error sending Telegram message: {e}")
-                        trade['status'] = 'rejected'
-                        update_trade_report(trades)
-                        if symbol in virtual_orders:
-                            del virtual_orders[symbol]
-                    continue
+                    symbol = trade['symbol']
+                    print(f"Monitor: Checking {symbol}.")
+                    # Fetch the last 5 seconds of k-line data
+                    klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_1SECOND, limit=5)
+                    if not klines:
+                        continue
 
-                prices = [float(k[4]) for k in klines]
-
-                for price in prices:
-                    # Check for SL/TP hits
-                    if trade['status'] in ['running', 'tp1_hit', 'tp2_hit']:
-                        if (trade['side'] == 'long' and price <= trade['sl']) or \
-                           (trade['side'] == 'short' and price >= trade['sl']):
+                    # Check for expired orders
+                    if time.time() * 1000 - trade['timestamp'] > 4 * 60 * 60 * 1000:
+                        if trade['status'] == 'pending':
                             try:
-                                bot.send_message(chat_id=keys.telegram_chat_id, text=f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}")
+                                bot.send_message(chat_id=keys.telegram_chat_id, text=f"⚠️ TRADE INVALIDATED ⚠️\nSymbol: {symbol}\nSide: {trade['side']}\nReason: Order expired (4 hours)")
                             except Exception as e:
                                 print(f"Error sending Telegram message: {e}")
-                            trade['status'] = 'sl_hit'
+                            trade['status'] = 'rejected'
                             update_trade_report(trades)
                             if symbol in virtual_orders:
                                 del virtual_orders[symbol]
-                            break
+                        continue
 
-                        if trade['status'] == 'running':
-                            if (trade['side'] == 'long' and price >= trade['entry_price'] * 1.005) or \
-                               (trade['side'] == 'short' and price <= trade['entry_price'] * 0.995):
-                                new_sl = trade['entry_price'] * 1.001 if trade['side'] == 'long' else trade['entry_price'] * 0.999
-                                if (trade['side'] == 'long' and new_sl > trade['sl']) or \
-                                   (trade['side'] == 'short' and new_sl < trade['sl']):
-                                    trade['sl'] = new_sl
-                                    update_trade_report(trades)
-                                    try:
-                                        bot.send_message(chat_id=keys.telegram_chat_id, text=f"🔒 STOP LOSS UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {trade['sl']:.8f}")
-                                    except Exception as e:
-                                        print(f"Error sending Telegram message: {e}")
+                    prices = [float(k[4]) for k in klines]
 
-                        if trade['status'] == 'running' and ((trade['side'] == 'long' and price >= trade['tp1']) or \
-                           (trade['side'] == 'short' and price <= trade['tp1'])):
-                            trade['status'] = 'tp1_hit'
-                            trade['sl'] = trade['entry_price']
-                            trade['quantity'] *= 0.5
-                            update_trade_report(trades)
-                            try:
-                                bot.send_message(chat_id=keys.telegram_chat_id, text=f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 50% of the position.\nNew SL: {trade['sl']:.8f}")
-                            except Exception as e:
-                                print(f"Error sending Telegram message: {e}")
+                    for price in prices:
+                        # Check for SL/TP hits
+                        if trade['status'] in ['running', 'tp1_hit', 'tp2_hit']:
+                            if (trade['side'] == 'long' and price <= trade['sl']) or \
+                               (trade['side'] == 'short' and price >= trade['sl']):
+                                try:
+                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=100)
+                                    if klines_for_chart:
+                                        image_buffer = generate_fib_chart(symbol, klines_for_chart, trade['side'], trade['entry_price'] + (trade['entry_price'] - trade['sl']), trade['sl'], trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
+                                        caption = f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}"
+                                        send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
+                                    else:
+                                        bot.send_message(chat_id=keys.telegram_chat_id, text=f"🛑 STOP LOSS HIT 🛑\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}")
+                                except Exception as e:
+                                    print(f"Error sending Telegram message: {e}")
+                                trade['status'] = 'sl_hit'
+                                update_trade_report(trades)
+                                if symbol in virtual_orders:
+                                    del virtual_orders[symbol]
+                                break
 
-                        if trade['status'] == 'tp1_hit' and ((trade['side'] == 'long' and price >= trade['tp2']) or \
-                           (trade['side'] == 'short' and price <= trade['tp2'])):
-                            trade['status'] = 'tp2_hit'
-                            trade['sl'] = trade['tp1']
-                            trade['quantity'] *= 0.6
-                            update_trade_report(trades)
-                            try:
-                                bot.send_message(chat_id=keys.telegram_chat_id, text=f"🎉 TAKE PROFIT 2 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 40% of the position.\nNew SL: {trade['sl']:.8f}")
-                            except Exception as e:
-                                print(f"Error sending Telegram message: {e}")
+                            if trade['status'] == 'running':
+                                if (trade['side'] == 'long' and price >= trade['entry_price'] * 1.005) or \
+                                   (trade['side'] == 'short' and price <= trade['entry_price'] * 0.995):
+                                    new_sl = trade['entry_price'] * 1.001 if trade['side'] == 'long' else trade['entry_price'] * 0.999
+                                    if (trade['side'] == 'long' and new_sl > trade['sl']) or \
+                                       (trade['side'] == 'short' and new_sl < trade['sl']):
+                                        trade['sl'] = new_sl
+                                        update_trade_report(trades)
+                                        try:
+                                            bot.send_message(chat_id=keys.telegram_chat_id, text=f"🔒 STOP LOSS UPDATED 🔒\nSymbol: {symbol}\nSide: {trade['side']}\nNew SL: {trade['sl']:.8f}")
+                                        except Exception as e:
+                                            print(f"Error sending Telegram message: {e}")
 
-                    # Check for triggered orders
-                    elif trade['status'] == 'pending':
-                        if (trade['side'] == 'long' and price >= trade['entry_price']) or \
-                           (trade['side'] == 'short' and price <= trade['entry_price']):
-                            
-                            # In a real scenario, you would place a market order here
-                            trade['status'] = 'running'
-                            update_trade_report(trades)
-                            try:
-                                bot.send_message(chat_id=keys.telegram_chat_id, text=f"✅ TRADE TRIGGERED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nTP1: {trade['tp1']:.8f}\nTP2: {trade['tp2']:.8f}\nTP3: {trade['tp3']}\nSL: {trade['sl']:.8f}\nLeverage: {leverage}x")
-                            except Exception as e:
-                                print(f"Error sending Telegram message: {e}")
-                            break
+                            if trade['status'] == 'running' and ((trade['side'] == 'long' and price >= trade['tp1']) or \
+                               (trade['side'] == 'short' and price <= trade['tp1'])):
+                                trade['status'] = 'tp1_hit'
+                                trade['sl'] = trade['entry_price']
+                                trade['quantity'] *= 0.5
+                                update_trade_report(trades)
+                                try:
+                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=100)
+                                    if klines_for_chart:
+                                        image_buffer = generate_fib_chart(symbol, klines_for_chart, trade['side'], trade['entry_price'] + (trade['entry_price'] - trade['sl']), trade['sl'], trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
+                                        caption = f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 50% of the position.\nNew SL: {trade['sl']:.8f}"
+                                        send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
+                                    else:
+                                        bot.send_message(chat_id=keys.telegram_chat_id, text=f"🎉 TAKE PROFIT 1 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 50% of the position.\nNew SL: {trade['sl']:.8f}")
+                                except Exception as e:
+                                    print(f"Error sending Telegram message: {e}")
+
+                            if trade['status'] == 'tp1_hit' and ((trade['side'] == 'long' and price >= trade['tp2']) or \
+                               (trade['side'] == 'short' and price <= trade['tp2'])):
+                                trade['status'] = 'tp2_hit'
+                                trade['sl'] = trade['tp1']
+                                trade['quantity'] *= 0.6
+                                update_trade_report(trades)
+                                try:
+                                    klines_for_chart = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=100)
+                                    if klines_for_chart:
+                                        image_buffer = generate_fib_chart(symbol, klines_for_chart, trade['side'], trade['entry_price'] + (trade['entry_price'] - trade['sl']), trade['sl'], trade['entry_price'], trade['sl'], trade['tp1'], trade['tp2'])
+                                        caption = f"🎉 TAKE PROFIT 2 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 40% of the position.\nNew SL: {trade['sl']:.8f}"
+                                        send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
+                                    else:
+                                        bot.send_message(chat_id=keys.telegram_chat_id, text=f"🎉 TAKE PROFIT 2 HIT 🎉\nSymbol: {symbol}\nSide: {trade['side']}\nPrice: {price:.8f}\nClosing 40% of the position.\nNew SL: {trade['sl']:.8f}")
+                                except Exception as e:
+                                    print(f"Error sending Telegram message: {e}")
+
+                        # Check for triggered orders
+                        elif trade['status'] == 'pending':
+                            if (trade['side'] == 'long' and price >= trade['entry_price']) or \
+                               (trade['side'] == 'short' and price <= trade['entry_price']):
+                                
+                            # In a real scenario, you would place a limit order here
+                            # place_limit_order(client, symbol, trade['side'], trade['quantity'], trade['entry_price'])
+                                trade['status'] = 'running'
+                                update_trade_report(trades)
+                                try:
+                                    bot.send_message(chat_id=keys.telegram_chat_id, text=f"✅ TRADE TRIGGERED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nTP1: {trade['tp1']:.8f}\nTP2: {trade['tp2']:.8f}\nTP3: {trade['tp3']}\nSL: {trade['sl']:.8f}\nLeverage: {leverage}x")
+                                except Exception as e:
+                                    print(f"Error sending Telegram message: {e}")
+                                break
         except Exception as e:
             print(f"Error in order status monitor: {e}")
 
@@ -329,6 +373,7 @@ def order_status_monitor(client, bot):
 virtual_orders = {}
 trades = []
 leverage = 0
+trades_lock = threading.Lock()
 
 def main():
     """
@@ -400,8 +445,10 @@ def main():
     if os.path.exists('trades.json'):
         with open('trades.json', 'r') as f:
             try:
-                trades.extend(json.load(f))
-                for trade in trades:
+                loaded_trades = json.load(f)
+                with trades_lock:
+                    trades.extend(loaded_trades)
+                for trade in loaded_trades:
                     if trade['status'] in ['running', 'tp1_hit', 'tp2_hit', 'pending']:
                         virtual_orders[trade['symbol']] = trade
             except json.JSONDecodeError:
@@ -413,61 +460,76 @@ def main():
     while True:
         print("Starting new scan cycle...")
         for symbol in symbols:
-            print(f"Scanning {symbol}...")
-            klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles)
-            if not klines:
-                continue
+            try:
+                print(f"Scanning {symbol}...")
+                klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles)
+                if not klines:
+                    continue
 
-            swing_highs, swing_lows = get_swing_points(klines, swing_window)
-            trend = get_trend(swing_highs, swing_lows)
-            
-            # Check for rejected symbols cooldown
-            if symbol in rejected_symbols and time.time() - rejected_symbols[symbol] < 4 * 60 * 60:
-                continue
+                swing_highs, swing_lows = get_swing_points(klines, swing_window)
+                trend = get_trend(swing_highs, swing_lows)
+                
+                # Check for rejected symbols cooldown
+                if symbol in rejected_symbols and time.time() - rejected_symbols[symbol] < 4 * 60 * 60:
+                    continue
 
-            # Check for new signals
-            if symbol not in virtual_orders:
-                if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                    last_swing_high = swing_highs[-1][1]
-                    last_swing_low = swing_lows[-1][1]
-                    entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                    atr = get_atr(klines, atr_value)
-                    
-                    sl = last_swing_high
-                    tp1 = entry_price - (sl - entry_price)
-                    tp2 = entry_price - (sl - entry_price) * 2
-                    tp3 = 0 # Floating TP
+                # Check for new signals
+                if symbol not in virtual_orders:
+                    current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                    if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                        if time.time() * 1000 - swing_highs[-1][0] > 4 * 60 * 60 * 1000:
+                            continue
+                        last_swing_high = swing_highs[-1][1]
+                        last_swing_low = swing_lows[-1][1]
+                        entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
+                        if current_price < entry_price:
+                            continue
+                        atr = get_atr(klines, atr_value)
+                        
+                        sl = last_swing_high
+                        tp1 = entry_price - (sl - entry_price)
+                        tp2 = entry_price - (sl - entry_price) * 2
+                        tp3 = 0 # Floating TP
 
-                    
-                    image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                    caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
-                    send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
+                        
+                        image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
+                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
+                        send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                    new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': 1, 'timestamp': klines[-1][0]}
-                    trades.append(new_trade)
-                    virtual_orders[symbol] = new_trade
-                    update_trade_report(trades)
+                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': 1, 'timestamp': klines[-1][0]}
+                        with trades_lock:
+                            trades.append(new_trade)
+                        virtual_orders[symbol] = new_trade
+                        update_trade_report(trades)
 
-                elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                    last_swing_high = swing_highs[-1][1]
-                    last_swing_low = swing_lows[-1][1]
-                    entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                    atr = get_atr(klines, atr_value)
+                    elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                        if time.time() * 1000 - swing_lows[-1][0] > 4 * 60 * 60 * 1000:
+                            continue
+                        last_swing_high = swing_highs[-1][1]
+                        last_swing_low = swing_lows[-1][1]
+                        entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
+                        if current_price > entry_price:
+                            continue
+                        atr = get_atr(klines, atr_value)
 
-                    sl = last_swing_low
-                    tp1 = entry_price + (entry_price - sl)
-                    tp2 = entry_price + (entry_price - sl) * 2
-                    tp3 = 0 # Floating TP
+                        sl = last_swing_low
+                        tp1 = entry_price + (entry_price - last_swing_low)
+                        tp2 = entry_price + (entry_price - last_swing_low) * 2
+                        tp3 = 0 # Floating TP
 
 
-                    image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                    caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
-                    send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
+                        image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
+                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
+                        send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
 
-                    new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': 1, 'timestamp': klines[-1][0]}
-                    trades.append(new_trade)
-                    virtual_orders[symbol] = new_trade
-                    update_trade_report(trades)
+                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': 1, 'timestamp': klines[-1][0]}
+                        with trades_lock:
+                            trades.append(new_trade)
+                        virtual_orders[symbol] = new_trade
+                        update_trade_report(trades)
+            except Exception as e:
+                print(f"Error scanning {symbol}: {e}")
+                rejected_symbols[symbol] = time.time() # Add to rejected list to avoid spamming errors
 
 
         print("Scan cycle complete. Cooling down for 2 minutes...")
