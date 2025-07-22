@@ -668,16 +668,31 @@ def update_trade_report(trades, backtest_mode=False):
         with open('trades.json', 'w') as f:
             json.dump(trades, f, indent=4)
 
-def place_limit_order(client, symbol, side, quantity, price):
+def place_real_order(client, symbol, side, quantity, live_mode=False):
     """
-    Place a limit order on Binance.
+    Place a real order on Binance.
     """
-    try:
-        # TODO: Implement actual order placement
-        print(f"Placing {side} limit order for {quantity} {symbol} at {price}...")
+    if not live_mode:
+        print(f"VIRTUAL ORDER: Placing {side} order for {quantity} {symbol}")
         return {"status": "success"}
+    try:
+        if side.lower() == 'long':
+            order_side = Client.SIDE_BUY
+        elif side.lower() == 'short':
+            order_side = Client.SIDE_SELL
+        else:
+            raise ValueError("Side must be 'long' or 'short'")
+            
+        order = client.create_order(
+            symbol=symbol,
+            side=order_side,
+            type=Client.ORDER_TYPE_MARKET,
+            quantity=quantity
+        )
+        print(f"Placed {side} order for {quantity} {symbol}: {order}")
+        return {"status": "success", "order": order}
     except Exception as e:
-        print(f"Error placing limit order for {symbol}: {e}")
+        print(f"Error placing real order for {symbol}: {e}")
         return {"status": "error", "message": str(e)}
 
 async def send_start_message(bot, backtest_mode=False):
@@ -762,7 +777,7 @@ async def op_command(update, context):
             caption = f"Open Trade: {symbol}\nSide: {trade['side']}\nEntry: {trade['entry_price']:.8f}\nCurrent Price: {current_price:.8f}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}"
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_buffer, caption=caption)
 
-async def order_status_monitor(client, application, backtest_mode=False):
+async def order_status_monitor(client, application, backtest_mode=False, live_mode=False):
     """
     Continuously monitor the status of open and pending trades.
     """
@@ -878,12 +893,13 @@ async def order_status_monitor(client, application, backtest_mode=False):
                             if (trade['side'] == 'long' and price >= trade['entry_price']) or \
                                (trade['side'] == 'short' and price <= trade['entry_price']):
                                 
-                            # In a real scenario, you would place a limit order here
-                            # place_limit_order(client, symbol, trade['side'], trade['quantity'], trade['entry_price'])
+                                # In a real scenario, you would place a limit order here
+                                if live_mode:
+                                    place_real_order(client, symbol, trade['side'], trade['quantity'], live_mode)
                                 trade['status'] = 'running'
                                 update_trade_report(trades)
                                 try:
-                                    await bot.send_message(chat_id=keys.telegram_chat_id, text=f"✅ TRADE TRIGGERED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nTP1: {trade['tp1']:.8f}\nTP2: {trade['tp2']:.8f}\nTP3: {trade['tp3']}\nSL: {trade['sl']:.8f}\nLeverage: {leverage}x")
+                                    await bot.send_message(chat_id=keys.telegram_chat_id, text=f"✅ TRADE TRIGGERED ✅\nSymbol: {symbol}\nEntry: {trade['entry_price']:.8f}\nSide: {trade['side']}\nTP1: {trade['tp1']:.8f}\nTP2: {trade['tp2']:.8f}\nTP3: {trade['tp3']:.8f}\nSL: {trade['sl']:.8f}\nLeverage: {leverage}x")
                                 except Exception as e:
                                     print(f"Error sending Telegram message: {e}")
                                 break
@@ -955,7 +971,7 @@ async def main():
     def run_monitor():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(order_status_monitor(client, application, backtest_mode))
+        loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode))
 
     monitor_thread = threading.Thread(target=run_monitor, daemon=True)
     monitor_thread.start()
