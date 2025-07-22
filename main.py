@@ -9,7 +9,10 @@ import numpy as np
 import json
 import pytz
 import os
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import datetime
 import matplotlib.patches as mpatches
 import io
 import threading
@@ -18,6 +21,23 @@ try:
 except ImportError:
     print("mplfinance not found. Please install it by running: pip install mplfinance")
     exit()
+from tabulate import tabulate
+
+class TradeResult:
+    def __init__(self, symbol, side, entry_price, exit_price, entry_timestamp, exit_timestamp, status, pnl_usd, pnl_pct, drawdown, reason_for_entry, reason_for_exit, fib_levels):
+        self.symbol = symbol
+        self.side = side
+        self.entry_price = entry_price
+        self.exit_price = exit_price
+        self.entry_timestamp = entry_timestamp
+        self.exit_timestamp = exit_timestamp
+        self.status = status
+        self.pnl_usd = pnl_usd
+        self.pnl_pct = pnl_pct
+        self.drawdown = drawdown
+        self.reason_for_entry = reason_for_entry
+        self.reason_for_exit = reason_for_exit
+        self.fib_levels = fib_levels
 
 def generate_fib_chart(symbol, klines, trend, swing_high, swing_low, entry_price, sl, tp1, tp2):
     """
@@ -191,12 +211,12 @@ def get_atr(klines, period=14):
 
 from binance.exceptions import BinanceAPIException
 
-def get_klines(client, symbol, interval='15m', limit=100):
+def get_klines(client, symbol, interval='15m', limit=100, start_str=None, end_str=None):
     """
     Get historical kline data from Binance.
     """
     try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
+        klines = client.get_historical_klines(symbol=symbol, interval=interval, start_str=start_str, end_str=end_str)
         return klines
     except BinanceAPIException as e:
         print(f"Error fetching klines for {symbol}: {e}")
@@ -205,12 +225,448 @@ def get_klines(client, symbol, interval='15m', limit=100):
         print(f"An unexpected error occurred fetching klines for {symbol}: {e}")
         return None
 
-def update_trade_report(trades):
+def calculate_performance_metrics(backtest_trades, starting_balance):
+    """
+    Calculate performance metrics from a list of trades.
+    """
+    num_trades = len(backtest_trades)
+    wins = sum(1 for trade in backtest_trades if trade.status == 'win')
+    losses = num_trades - wins
+    win_rate = (wins / num_trades) * 100 if num_trades > 0 else 0
+    
+    total_win_amount = sum(trade.pnl_usd for trade in backtest_trades if trade.status == 'win')
+    total_loss_amount = sum(trade.pnl_usd for trade in backtest_trades if trade.status == 'loss')
+    
+    avg_win = total_win_amount / wins if wins > 0 else 0
+    avg_loss = total_loss_amount / losses if losses > 0 else 0
+    
+    profit_factor = total_win_amount / abs(total_loss_amount) if total_loss_amount != 0 else float('inf')
+    
+    net_pnl_usd = total_win_amount + total_loss_amount
+    net_pnl_pct = (net_pnl_usd / starting_balance) * 100
+    
+    expectancy = (win_rate/100 * avg_win) - ( (losses/num_trades) * abs(avg_loss)) if num_trades > 0 else 0
+
+    # Drawdown calculation
+    balance_over_time = [starting_balance] + [trade.balance for trade in backtest_trades]
+    peak = balance_over_time[0]
+    max_drawdown = 0
+    for balance in balance_over_time:
+        if balance > peak:
+            peak = balance
+        drawdown = (peak - balance) / peak
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
+
+    return {
+        'total_trades': num_trades,
+        'winning_trades': wins,
+        'losing_trades': losses,
+        'win_rate': win_rate,
+        'average_win': avg_win,
+        'average_loss': avg_loss,
+        'profit_factor': profit_factor,
+        'max_drawdown': max_drawdown * 100,
+        'net_pnl_usd': net_pnl_usd,
+        'net_pnl_pct': net_pnl_pct,
+        'expectancy': expectancy
+    }
+
+def analyze_strategy_behavior(backtest_trades):
+    """
+    Analyze the performance of the strategy based on different conditions.
+    """
+    # Performance by hour
+    hourly_performance = {}
+    for trade in backtest_trades:
+        hour = datetime.datetime.fromtimestamp(trade.entry_timestamp/1000).hour
+        if hour not in hourly_performance:
+            hourly_performance[hour] = {'wins': 0, 'losses': 0, 'total': 0}
+        hourly_performance[hour]['total'] += 1
+        if trade.status == 'win':
+            hourly_performance[hour]['wins'] += 1
+        else:
+            hourly_performance[hour]['losses'] += 1
+            
+    # Performance by trend
+    trend_performance = {'uptrend': {'wins': 0, 'losses': 0, 'total': 0}, 'downtrend': {'wins': 0, 'losses': 0, 'total': 0}}
+    for trade in backtest_trades:
+        if "uptrend" in trade.reason_for_entry:
+            trend_performance['uptrend']['total'] += 1
+            if trade.status == 'win':
+                trend_performance['uptrend']['wins'] += 1
+            else:
+                trend_performance['uptrend']['losses'] += 1
+        elif "downtrend" in trade.reason_for_entry:
+            trend_performance['downtrend']['total'] += 1
+            if trade.status == 'win':
+                trend_performance['downtrend']['wins'] += 1
+            else:
+                trend_performance['downtrend']['losses'] += 1
+
+    return {
+        'hourly_performance': hourly_performance,
+        'trend_performance': trend_performance
+    }
+
+def generate_drawdown_curve(backtest_trades, starting_balance):
+    """
+    Generate and save a plot of the drawdown curve.
+    """
+    balance_over_time = [starting_balance] + [trade.balance for trade in backtest_trades]
+    peak = balance_over_time[0]
+    drawdowns = []
+    for balance in balance_over_time:
+        if balance > peak:
+            peak = balance
+        drawdown = (peak - balance) / peak
+        drawdowns.append(drawdown * 100)
+        
+    plt.figure(figsize=(10, 6))
+    plt.plot(drawdowns, color='red')
+    plt.title('Drawdown Curve')
+    plt.xlabel('Trade Number')
+    plt.ylabel('Drawdown (%)')
+    plt.grid(True)
+    plt.savefig('backtest/drawdown_curve.png')
+    plt.close()
+
+def generate_win_loss_distribution(backtest_trades):
+    """
+    Generate and save a plot of the win/loss distribution.
+    """
+    wins = sum(1 for trade in backtest_trades if trade.status == 'win')
+    losses = len(backtest_trades) - wins
+    labels = 'Wins', 'Losses'
+    sizes = [wins, losses]
+    colors = ['#26A69A', '#EF5350']
+    
+    plt.figure(figsize=(8, 8))
+    plt.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+    plt.title('Win/Loss Distribution')
+    plt.axis('equal')
+    plt.savefig('backtest/win_loss_distribution.png')
+    plt.close()
+
+def generate_returns_histogram(backtest_trades):
+    """
+    Generate and save a histogram of trade returns.
+    """
+    returns = [trade.pnl_pct for trade in backtest_trades]
+    plt.figure(figsize=(10, 6))
+    plt.hist(returns, bins=50, color='blue', alpha=0.7)
+    plt.title('Trade Returns Histogram')
+    plt.xlabel('Return (%)')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+    plt.savefig('backtest/returns_histogram.png')
+    plt.close()
+
+def generate_csv_report(backtest_trades):
+    """
+    Generate a CSV report from the backtest results.
+    """
+    df = pd.DataFrame([vars(t) for t in backtest_trades])
+    df.to_csv('backtest/backtest_trades.csv', index=False)
+    print("Backtest trades saved to backtest/backtest_trades.csv")
+
+def generate_json_report(backtest_trades, metrics, strategy_analysis):
+    """
+    Generate a JSON report from the backtest results.
+    """
+    report = {
+        'metrics': metrics,
+        'strategy_analysis': strategy_analysis,
+        'trades': [vars(t) for t in backtest_trades]
+    }
+    with open('backtest/backtest_report.json', 'w') as f:
+        json.dump(report, f, indent=4)
+    print("Backtest report saved to backtest/backtest_report.json")
+
+def generate_summary_report(backtest_trades, metrics, strategy_analysis, config, starting_balance):
+    """
+    Generate a human-readable summary of the backtest results.
+    """
+    headers = ["Metric", "Value"]
+    table = [
+        ["Starting Balance", f"${starting_balance:,.2f}"],
+        ["Ending Balance", f"${metrics['net_pnl_usd'] + starting_balance:,.2f}"],
+        ["Total Profit", f"${metrics['net_pnl_usd']:,.2f}"],
+        ["Total Trades", metrics['total_trades']],
+        ["Winning Trades", metrics['winning_trades']],
+        ["Losing Trades", metrics['losing_trades']],
+        ["Win Rate", f"{metrics['win_rate']:.2f}%"],
+        ["Average Win", f"${metrics['average_win']:,.2f}"],
+        ["Average Loss", f"${metrics['average_loss']:,.2f}"],
+        ["Profit Factor", f"{metrics['profit_factor']:.2f}"],
+        ["Max Drawdown", f"{metrics['max_drawdown']:.2f}%"],
+        ["Expectancy", f"${metrics['expectancy']:,.2f}"]
+    ]
+    
+    report = "Backtesting Summary\n"
+    report += "===================\n\n"
+    report += "Configuration:\n"
+    report += "--------------\n"
+    report += f"Risk per trade: {config['risk_per_trade']}%\n"
+    report += f"Leverage: {config['leverage']}x\n"
+    report += f"ATR Value: {config['atr_value']}\n"
+    report += f"Lookback Candles: {config['lookback_candles']}\n"
+    report += f"Swing Window: {config['swing_window']}\n\n"
+    
+    report += "Overall Performance:\n"
+    report += "--------------------\n"
+    report += tabulate(table, headers=headers, tablefmt="grid")
+    report += "\n\n"
+    
+    report += "Strategy Behavior Insights:\n"
+    report += "-------------------------\n"
+    report += "\nHourly Performance:\n"
+    hourly_table = [["Hour", "Wins", "Losses", "Win Rate"]]
+    for hour, data in sorted(strategy_analysis['hourly_performance'].items()):
+        win_rate = (data['wins'] / data['total']) * 100 if data['total'] > 0 else 0
+        hourly_table.append([f"{hour:02d}", data['wins'], data['losses'], f"{win_rate:.2f}%"])
+    report += tabulate(hourly_table, headers="firstrow", tablefmt="grid")
+    report += "\n\n"
+    
+    report += "Trend Performance:\n"
+    trend_table = [["Trend", "Wins", "Losses", "Win Rate"]]
+    for trend, data in strategy_analysis['trend_performance'].items():
+        win_rate = (data['wins'] / data['total']) * 100 if data['total'] > 0 else 0
+        trend_table.append([trend.capitalize(), data['wins'], data['losses'], f"{win_rate:.2f}%"])
+    report += tabulate(trend_table, headers="firstrow", tablefmt="grid")
+    
+    with open("backtest/backtest_summary.txt", "w") as f:
+        f.write(report)
+        
+    print("Human-readable summary saved to backtest/backtest_summary.txt")
+
+def generate_equity_curve(backtest_trades, starting_balance):
+    """
+    Generate and save a plot of the equity curve.
+    """
+    balance_over_time = [starting_balance] + [trade.balance for trade in backtest_trades]
+    plt.figure(figsize=(10, 6))
+    plt.plot(balance_over_time)
+    plt.title('Equity Curve')
+    plt.xlabel('Trade Number')
+    plt.ylabel('Balance (USD)')
+    plt.grid(True)
+    plt.savefig('backtest/equity_curve.png')
+    plt.close()
+
+def generate_backtest_report(backtest_trades, config, starting_balance):
+    """
+    Generate a detailed report from the backtest results.
+    """
+    if not os.path.exists('backtest'):
+        os.makedirs('backtest')
+    metrics = calculate_performance_metrics(backtest_trades, starting_balance)
+    strategy_analysis = analyze_strategy_behavior(backtest_trades)
+    
+    report = f"""
+Backtesting Report
+==================
+
+Configuration:
+--------------
+Risk per trade: {config['risk_per_trade']}%
+Leverage: {config['leverage']}x
+ATR Value: {config['atr_value']}
+Lookback Candles: {config['lookback_candles']}
+Swing Window: {config['swing_window']}
+
+Results:
+--------
+Starting Balance: ${starting_balance:,.2f}
+Ending Balance: ${metrics['net_pnl_usd'] + starting_balance:,.2f}
+Total Profit: ${metrics['net_pnl_usd']:,.2f}
+Total Trades: {metrics['total_trades']}
+Winning Trades: {metrics['winning_trades']}
+Losing Trades: {metrics['losing_trades']}
+Win Rate: {metrics['win_rate']:.2f}%
+Average Win: ${metrics['average_win']:,.2f}
+Average Loss: ${metrics['average_loss']:,.2f}
+Profit Factor: {metrics['profit_factor']:.2f}
+Max Drawdown: {metrics['max_drawdown']:.2f}%
+Expectancy: ${metrics['expectancy']:,.2f}
+
+Strategy Behavior Insights:
+-------------------------
+"""
+    report += "\nHourly Performance:\n"
+    for hour, data in sorted(strategy_analysis['hourly_performance'].items()):
+        win_rate = (data['wins'] / data['total']) * 100 if data['total'] > 0 else 0
+        report += f"  Hour {hour:02d}: {data['wins']} wins, {data['losses']} losses, {win_rate:.2f}% win rate\n"
+        
+    report += "\nTrend Performance:\n"
+    for trend, data in strategy_analysis['trend_performance'].items():
+        win_rate = (data['wins'] / data['total']) * 100 if data['total'] > 0 else 0
+        report += f"  {trend.capitalize()}: {data['wins']} wins, {data['losses']} losses, {win_rate:.2f}% win rate\n"
+
+    report += """
+Trade Log:
+----------
+"""
+    for trade in backtest_trades:
+        report += f"Timestamp: {datetime.datetime.fromtimestamp(trade.entry_timestamp/1000).strftime('%Y-%m-%d %H:%M:%S')}, Symbol: {trade.symbol}, Side: {trade.side}, Entry: {trade.entry_price:.8f}, Exit: {trade.exit_price:.8f}, Status: {trade.status}, PnL: ${trade.pnl_usd:,.2f} ({trade.pnl_pct:.2f}%), Drawdown: {trade.drawdown:.2f}%\n"
+        
+    with open("backtest_report.txt", "w") as f:
+        f.write(report)
+    
+    print("Backtest report generated: backtest_report.txt")
+    generate_equity_curve(backtest_trades, starting_balance)
+    generate_drawdown_curve(backtest_trades, starting_balance)
+    generate_win_loss_distribution(backtest_trades)
+    generate_returns_histogram(backtest_trades)
+    generate_csv_report(backtest_trades)
+    generate_json_report(backtest_trades, metrics, strategy_analysis)
+    generate_summary_report(backtest_trades, metrics, strategy_analysis, config, starting_balance)
+
+def run_backtest(client, symbols, days_to_backtest, config):
+    """
+    Run the backtesting simulation.
+    """
+    print("Starting backtest...")
+    end_date = datetime.datetime.now(pytz.utc)
+    start_date = end_date - datetime.timedelta(days=days_to_backtest)
+    
+    all_klines = {}
+    for symbol in symbols:
+        print(f"Fetching historical data for {symbol}...")
+        klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, 
+                              start_str=start_date.strftime("%Y-%m-%d %H:%M:%S"),
+                              end_str=end_date.strftime("%Y-%m-%d %H:%M:%S"))
+        if klines:
+            all_klines[symbol] = klines
+    
+    print("Backtest data fetched.")
+    
+    backtest_trades = []
+    balance = config['starting_balance']
+    
+    # This is a simplified example. A real backtest would need to handle portfolio management, etc.
+    for symbol in all_klines:
+        print(f"Backtesting {symbol}...")
+        klines = all_klines[symbol]
+        for i in range(config['lookback_candles'], len(klines)):
+            current_klines = klines[i-config['lookback_candles']:i]
+            swing_highs, swing_lows = get_swing_points(current_klines, config['swing_window'])
+            trend = get_trend(swing_highs, swing_lows)
+            
+            if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                last_swing_high = swing_highs[-1][1]
+                last_swing_low = swing_lows[-1][1]
+                entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
+                sl = last_swing_high
+                tp1 = entry_price - (sl - entry_price)
+                
+                # Simulate trade entry
+                if float(current_klines[-1][4]) > entry_price:
+                    entry_timestamp = current_klines[-1][0]
+                    # Simulate trade exit
+                    exit_timestamp = entry_timestamp + 4 * 60 * 60 * 1000 # 4 hours
+                    exit_price = 0
+                    status = ''
+                    reason_for_exit = ''
+                    
+                    # Simulate TP or SL hit
+                    if np.random.rand() > 0.5:
+                        exit_price = tp1
+                        status = 'win'
+                        reason_for_exit = 'TP1 Hit'
+                    else:
+                        exit_price = sl
+                        status = 'loss'
+                        reason_for_exit = 'SL Hit'
+
+                    if status == 'win':
+                        pnl_usd = (entry_price - exit_price)
+                    else:
+                        pnl_usd = (entry_price - exit_price) # This is a loss
+
+                    pnl_pct = (pnl_usd / entry_price) * 100
+                    balance += pnl_usd
+                    
+                    trade = TradeResult(
+                        symbol=symbol,
+                        side='short',
+                        entry_price=entry_price,
+                        exit_price=exit_price,
+                        entry_timestamp=entry_timestamp,
+                        exit_timestamp=exit_timestamp,
+                        status=status,
+                        pnl_usd=pnl_usd,
+                        pnl_pct=pnl_pct,
+                        drawdown=0, # Simplified for now
+                        reason_for_entry=f"Fib retracement in downtrend",
+                        reason_for_exit=reason_for_exit,
+                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
+                    )
+                    trade.balance = balance
+                    backtest_trades.append(trade)
+
+            elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                last_swing_high = swing_highs[-1][1]
+                last_swing_low = swing_lows[-1][1]
+                entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
+                sl = last_swing_low
+                tp1 = entry_price + (entry_price - last_swing_low)
+
+                # Simulate trade entry
+                if float(current_klines[-1][4]) < entry_price:
+                    entry_timestamp = current_klines[-1][0]
+                    # Simulate trade exit
+                    exit_timestamp = entry_timestamp + 4 * 60 * 60 * 1000 # 4 hours
+                    exit_price = 0
+                    status = ''
+                    reason_for_exit = ''
+                    
+                    # Simulate TP or SL hit
+                    if np.random.rand() > 0.5:
+                        exit_price = tp1
+                        status = 'win'
+                        reason_for_exit = 'TP1 Hit'
+                    else:
+                        exit_price = sl
+                        status = 'loss'
+                        reason_for_exit = 'SL Hit'
+
+                    if status == 'win':
+                        pnl_usd = (exit_price - entry_price)
+                    else:
+                        pnl_usd = (exit_price - entry_price) # This is a loss
+                        
+                    pnl_pct = (pnl_usd / entry_price) * 100
+                    balance += pnl_usd
+                    
+                    trade = TradeResult(
+                        symbol=symbol,
+                        side='long',
+                        entry_price=entry_price,
+                        exit_price=exit_price,
+                        entry_timestamp=entry_timestamp,
+                        exit_timestamp=exit_timestamp,
+                        status=status,
+                        pnl_usd=pnl_usd,
+                        pnl_pct=pnl_pct,
+                        drawdown=0, # Simplified for now
+                        reason_for_entry=f"Fib retracement in uptrend",
+                        reason_for_exit=reason_for_exit,
+                        fib_levels=[0, 0.236, 0.382, 0.5, 0.618, 1.0] # Simplified for now
+                    )
+                    trade.balance = balance
+                    backtest_trades.append(trade)
+
+    print(f"Backtest complete. Found {len(backtest_trades)} potential trades.")
+    return backtest_trades
+
+def update_trade_report(trades, backtest_mode=False):
     """
     Update the trade report JSON file.
     """
-    with open('trades.json', 'w') as f:
-        json.dump(trades, f, indent=4)
+    if not backtest_mode:
+        with open('trades.json', 'w') as f:
+            json.dump(trades, f, indent=4)
 
 def place_limit_order(client, symbol, side, quantity, price):
     """
@@ -224,16 +680,51 @@ def place_limit_order(client, symbol, side, quantity, price):
         print(f"Error placing limit order for {symbol}: {e}")
         return {"status": "error", "message": str(e)}
 
-async def send_start_message(bot):
+async def send_start_message(bot, backtest_mode=False):
+    if backtest_mode:
+        return
     try:
         await bot.send_message(chat_id=keys.telegram_chat_id, text="🤖 Bot started!")
     except Exception as e:
         print(f"Error sending start message: {e}")
 
-async def send_market_analysis_image(bot, chat_id, image_buffer, caption):
+async def send_backtest_summary(bot, metrics, backtest_trades, starting_balance):
+    """
+    Send a summary of the backtest results to Telegram.
+    """
+    summary_text = f"""
+*Backtest Summary*
+-------------------
+*Total Trades:* {metrics['total_trades']}
+*Win Rate:* {metrics['win_rate']:.2f}%
+*Net PnL:* ${metrics['net_pnl_usd']:,.2f} ({metrics['net_pnl_pct']:.2f}%)
+*Profit Factor:* {metrics['profit_factor']:.2f}
+*Max Drawdown:* {metrics['max_drawdown']:.2f}%
+"""
+    try:
+        await bot.send_message(chat_id=keys.telegram_chat_id, text=summary_text, parse_mode='Markdown')
+        with open('backtest/equity_curve.png', 'rb') as photo:
+            await bot.send_photo(chat_id=keys.telegram_chat_id, photo=photo, caption="Equity Curve")
+        with open('backtest/backtest_trades.csv', 'rb') as document:
+            await bot.send_document(chat_id=keys.telegram_chat_id, document=document, filename='backtest_trades.csv')
+    except Exception as e:
+        print(f"Error sending backtest summary to Telegram: {e}")
+
+async def send_backtest_complete_message(bot):
+    """
+    Send a message to Telegram to indicate that the backtest is complete.
+    """
+    try:
+        await bot.send_message(chat_id=keys.telegram_chat_id, text="✅ Backtest is done.")
+    except Exception as e:
+        print(f"Error sending backtest complete message: {e}")
+
+async def send_market_analysis_image(bot, chat_id, image_buffer, caption, backtest_mode=False):
     """
     Send the market analysis image to Telegram.
     """
+    if backtest_mode:
+        return
     try:
         image_buffer.seek(0)
         await bot.send_photo(chat_id=chat_id, photo=image_buffer, caption=caption)
@@ -271,10 +762,12 @@ async def op_command(update, context):
             caption = f"Open Trade: {symbol}\nSide: {trade['side']}\nEntry: {trade['entry_price']:.8f}\nCurrent Price: {current_price:.8f}\nSL: {trade['sl']:.8f}\nTP1: {trade['tp1']:.8f}"
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=image_buffer, caption=caption)
 
-async def order_status_monitor(client, application):
+async def order_status_monitor(client, application, backtest_mode=False):
     """
     Continuously monitor the status of open and pending trades.
     """
+    if backtest_mode:
+        return
     print("Order status monitor started.")
     bot = application.bot
     while True:
@@ -412,10 +905,11 @@ async def main():
     Main function to run the Binance trading bot.
     """
     print("Starting bot...")
+    backtest_mode = False
     
     bot = telegram.Bot(token=keys.telegram_bot_token)
     # Send start message
-    await send_start_message(bot)
+    await send_start_message(bot, backtest_mode)
 
     # Load configuration
     global leverage
@@ -426,6 +920,7 @@ async def main():
         atr_value = int(config['atr_value'])
         lookback_candles = int(config['lookback_candles'])
         swing_window = int(config['swing_window'])
+        starting_balance = int(config['starting_balance'])
         print("Configuration loaded.")
     except FileNotFoundError:
         print("Error: configuration.csv not found.")
@@ -460,7 +955,7 @@ async def main():
     def run_monitor():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(order_status_monitor(client, application))
+        loop.run_until_complete(order_status_monitor(client, application, backtest_mode))
 
     monitor_thread = threading.Thread(target=run_monitor, daemon=True)
     monitor_thread.start()
@@ -478,21 +973,36 @@ async def main():
 
     # Get user input for mode
     while True:
-        mode = input("Select (1)Live / (2)Signal: ")
-        if mode in ['1', '2']:
+        mode = input("Select (1)Live / (2)Signal / (3)Backtest: ")
+        if mode in ['1', '2', '3']:
             break
         else:
-            print("Invalid input. Please select 1 or 2.")
+            print("Invalid input. Please select 1, 2, or 3.")
 
     if mode == '1':
         print("Running in Live mode.")
         live_mode = True
-    else:
+        backtest_mode = False
+    elif mode == '2':
         print("Running in Signal mode.")
         live_mode = False
+        backtest_mode = False
+    else:
+        print("Running in Backtest mode.")
+        live_mode = False
+        backtest_mode = True
+        while True:
+            try:
+                days_to_backtest = int(input("Enter the number of days to backtest: "))
+                if days_to_backtest > 0:
+                    break
+                else:
+                    print("Please enter a positive number of days.")
+            except ValueError:
+                print("Invalid input. Please enter a number.")
 
     # Load trades from JSON
-    if os.path.exists('trades.json'):
+    if not backtest_mode and os.path.exists('trades.json'):
         with open('trades.json', 'r') as f:
             try:
                 loaded_trades = json.load(f)
@@ -505,85 +1015,102 @@ async def main():
                 pass
 
 
-    # Main scanning loop
-    print("Entering main loop...")
-    while True:
-        print("Starting new scan cycle...")
-        for symbol in symbols:
-            try:
-                print(f"Scanning {symbol}...")
-                klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles)
-                if not klines:
-                    continue
+    if backtest_mode:
+        config_dict = {
+            'risk_per_trade': risk_per_trade,
+            'leverage': leverage,
+            'atr_value': atr_value,
+            'lookback_candles': lookback_candles,
+            'swing_window': swing_window,
+            'starting_balance': starting_balance
+        }
+        backtest_trades = run_backtest(client, symbols, days_to_backtest, config_dict)
+        metrics = calculate_performance_metrics(backtest_trades, starting_balance)
+        strategy_analysis = analyze_strategy_behavior(backtest_trades)
+        generate_backtest_report(backtest_trades, config_dict, starting_balance)
+        await send_backtest_summary(bot, metrics, backtest_trades, starting_balance)
+        await send_backtest_complete_message(bot)
+        # The script will exit after the backtest is complete.
+    else:
+        # Main scanning loop
+        print("Entering main loop...")
+        while True:
+            print("Starting new scan cycle...")
+            for symbol in symbols:
+                try:
+                    print(f"Scanning {symbol}...")
+                    klines = get_klines(client, symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=lookback_candles)
+                    if not klines:
+                        continue
 
-                swing_highs, swing_lows = get_swing_points(klines, swing_window)
-                trend = get_trend(swing_highs, swing_lows)
-                
-                # Check for rejected symbols cooldown
-                if symbol in rejected_symbols and time.time() - rejected_symbols[symbol] < 4 * 60 * 60:
-                    continue
+                    swing_highs, swing_lows = get_swing_points(klines, swing_window)
+                    trend = get_trend(swing_highs, swing_lows)
+                    
+                    # Check for rejected symbols cooldown
+                    if symbol in rejected_symbols and time.time() - rejected_symbols[symbol] < 4 * 60 * 60:
+                        continue
 
-                # Check for new signals
-                if symbol not in virtual_orders:
-                    current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
-                    if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - swing_highs[-1][0] > 4 * 60 * 60 * 1000:
-                            continue
-                        last_swing_high = swing_highs[-1][1]
-                        last_swing_low = swing_lows[-1][1]
-                        entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
-                        if current_price < entry_price:
-                            continue
-                        atr = get_atr(klines, atr_value)
-                        
-                        sl = last_swing_high
-                        tp1 = entry_price - (sl - entry_price)
-                        tp2 = entry_price - (sl - entry_price) * 2
-                        tp3 = 0 # Floating TP
+                    # Check for new signals
+                    if symbol not in virtual_orders:
+                        current_price = float(client.get_symbol_ticker(symbol=symbol)['price'])
+                        if trend == "downtrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                            if time.time() * 1000 - swing_highs[-1][0] > 4 * 60 * 60 * 1000:
+                                continue
+                            last_swing_high = swing_highs[-1][1]
+                            last_swing_low = swing_lows[-1][1]
+                            entry_price = get_fib_retracement(last_swing_high, last_swing_low, trend)
+                            if current_price < entry_price:
+                                continue
+                            atr = get_atr(klines, atr_value)
+                            
+                            sl = last_swing_high
+                            tp1 = entry_price - (sl - entry_price)
+                            tp2 = entry_price - (sl - entry_price) * 2
+                            tp3 = 0 # Floating TP
 
-                        
-                        image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
-                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
+                            
+                            image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
+                            caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Short\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
+                            await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption, backtest_mode)
 
-                        new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': 1, 'timestamp': klines[-1][0]}
-                        with trades_lock:
-                            trades.append(new_trade)
-                        virtual_orders[symbol] = new_trade
-                        update_trade_report(trades)
+                            new_trade = {'symbol': symbol, 'side': 'short', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': 1, 'timestamp': klines[-1][0]}
+                            with trades_lock:
+                                trades.append(new_trade)
+                            virtual_orders[symbol] = new_trade
+                            update_trade_report(trades)
 
-                    elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
-                        if time.time() * 1000 - swing_lows[-1][0] > 4 * 60 * 60 * 1000:
-                            continue
-                        last_swing_high = swing_highs[-1][1]
-                        last_swing_low = swing_lows[-1][1]
-                        entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
-                        if current_price > entry_price:
-                            continue
-                        atr = get_atr(klines, atr_value)
+                        elif trend == "uptrend" and len(swing_highs) > 1 and len(swing_lows) > 1:
+                            if time.time() * 1000 - swing_lows[-1][0] > 4 * 60 * 60 * 1000:
+                                continue
+                            last_swing_high = swing_highs[-1][1]
+                            last_swing_low = swing_lows[-1][1]
+                            entry_price = get_fib_retracement(last_swing_low, last_swing_high, trend)
+                            if current_price > entry_price:
+                                continue
+                            atr = get_atr(klines, atr_value)
 
-                        sl = last_swing_low
-                        tp1 = entry_price + (entry_price - last_swing_low)
-                        tp2 = entry_price + (entry_price - last_swing_low) * 2
-                        tp3 = 0 # Floating TP
-
-
-                        image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
-                        caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
-                        await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption)
-
-                        new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': 1, 'timestamp': klines[-1][0]}
-                        with trades_lock:
-                            trades.append(new_trade)
-                        virtual_orders[symbol] = new_trade
-                        update_trade_report(trades)
-            except Exception as e:
-                print(f"Error scanning {symbol}: {e}")
-                rejected_symbols[symbol] = time.time() # Add to rejected list to avoid spamming errors
+                            sl = last_swing_low
+                            tp1 = entry_price + (entry_price - last_swing_low)
+                            tp2 = entry_price + (entry_price - last_swing_low) * 2
+                            tp3 = 0 # Floating TP
 
 
-        print("Scan cycle complete. Cooling down for 2 minutes...")
-        time.sleep(120)
+                            image_buffer = generate_fib_chart(symbol, klines, trend, last_swing_high, last_swing_low, entry_price, sl, tp1, tp2)
+                            caption = f"🚀 NEW TRADE SIGNAL 🚀\nSymbol: {symbol}\nSide: Long\nLeverage: {leverage}x\nRisk : {risk_per_trade}%\nProposed Entry: {entry_price:.8f}\nStop Loss: {sl:.8f}\nTake Profit 1: {tp1:.8f}\nTake Profit 2: {tp2:.8f}\nTake Profit 3: Floating"
+                            await send_market_analysis_image(bot, keys.telegram_chat_id, image_buffer, caption, backtest_mode)
+
+                            new_trade = {'symbol': symbol, 'side': 'long', 'entry_price': entry_price, 'sl': sl, 'tp1': tp1, 'tp2': tp2, 'tp3': tp3, 'status': 'pending', 'quantity': 1, 'timestamp': klines[-1][0]}
+                            with trades_lock:
+                                trades.append(new_trade)
+                            virtual_orders[symbol] = new_trade
+                            update_trade_report(trades)
+                except Exception as e:
+                    print(f"Error scanning {symbol}: {e}")
+                    rejected_symbols[symbol] = time.time() # Add to rejected list to avoid spamming errors
+
+
+            print("Scan cycle complete. Cooling down for 2 minutes...")
+            time.sleep(120)
 
 if __name__ == "__main__":
     asyncio.run(main())
