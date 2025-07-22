@@ -895,7 +895,7 @@ async def order_status_monitor(client, application, backtest_mode=False, live_mo
                                 
                                 # In a real scenario, you would place a limit order here
                                 if live_mode:
-                                    place_real_order(client, symbol, trade['side'], trade['quantity'], live_mode)
+                                    place_real_order(client, symbol, trade['side'], trade['quantity'], live_mode=live_mode)
                                 trade['status'] = 'running'
                                 update_trade_report(trades)
                                 try:
@@ -968,13 +968,10 @@ async def main():
     application = ApplicationBuilder().token(keys.telegram_bot_token).build()
     
     # Start the order status monitor in a separate thread
-    def run_monitor():
+    def run_monitor(backtest_mode, live_mode):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(order_status_monitor(client, application, backtest_mode, live_mode))
-
-    monitor_thread = threading.Thread(target=run_monitor, daemon=True)
-    monitor_thread.start()
 
     op_handler = CommandHandler('op', op_command)
     application.add_handler(op_handler)
@@ -1018,6 +1015,9 @@ async def main():
                 print("Invalid input. Please enter a number.")
 
     # Load trades from JSON
+    monitor_thread = threading.Thread(target=run_monitor, args=(backtest_mode, live_mode), daemon=True)
+    monitor_thread.start()
+
     if not backtest_mode and os.path.exists('trades.json'):
         with open('trades.json', 'r') as f:
             try:
